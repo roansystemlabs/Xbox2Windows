@@ -2355,8 +2355,7 @@ def scalar_carry_chain(subtract, *, initialize_scc=True):
 
 
 def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
-    source, shader, case = (directory / name for name in ("carry-chain.hlsl", "carry-chain.cso", "carry-chain.case"))
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source, shader = (directory / name for name in ("carry-chain.hlsl", "carry-chain.cso"))
     for subtract in (False, True):
         program = scalar_carry_chain(subtract)
         source.write_text(translate_int(program), encoding="ascii")
@@ -2365,7 +2364,8 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
                  (0, 0xffffffff00000001), (0xffffffff00000000, 0xffffffff00000001)) if subtract else (
                      (0, 0), (0xffffffff, 1), (0xffffffff00000000, 0x100000000),
                      (0xffffffffffffffff, 1))
-        for a, b in pairs:
+        cases = []
+        for index, (a, b) in enumerate(pairs):
             low_a, low_b = a & 0xffffffff, b & 0xffffffff
             low = low_a - low_b if subtract else low_a + low_b
             wide = a - b if subtract else a + b
@@ -2373,8 +2373,12 @@ def check_scalar_carry_chain_draw(directory, compiler, renderer, backend):
                      not 0 <= low < 1 << 32, not 0 <= wide < 1 << 64)
             constants = bytearray(256)
             struct.pack_into("<QQ", constants, 12, a, b)
+            # Every case keeps its own file; the last one is also the mutation control below.
+            case = directory / f"carry-chain-{int(subtract)}-{index}.case"
             write_case(case, constants, tuple(as_float(w) for w in words), integer_rt=True)
-            subprocess.run(draw, check=True)
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+        draw = [renderer, backend, "--check-pixel-case", shader, case]
         # The final case wraps only because of the incoming SCC.
         old, new = ("s_subb_u32", "s_sub_u32") if subtract else ("s_addc_u32", "s_add_u32")
         source.write_text(translate_int([line.replace(old, new) for line in program]), encoding="ascii")
@@ -2399,21 +2403,24 @@ def scalar_leading_bit_values(width):
 
 
 def check_scalar_leading_bit_draw(directory, compiler, renderer, backend):
-    source, shader, case = (directory / name for name in ("leading-bit.hlsl", "leading-bit.cso", "leading-bit.case"))
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source, shader = (directory / name for name in ("leading-bit.hlsl", "leading-bit.cso"))
     for width in (32, 64):
         source.write_text(translate(scalar_leading_bit_values(width)), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
-        for lo, hi in ((0, 0), (0xffffffff, 0xffffffff), (0x80000000, 0x80000000),
-                       (0, 1), (0x80000000, 0), (1, 0), (0xfffffffe, 0xffffffff)):
+        cases = []
+        for index, (lo, hi) in enumerate(((0, 0), (0xffffffff, 0xffffffff), (0x80000000, 0x80000000),
+                                          (0, 1), (0x80000000, 0), (1, 0), (0xfffffffe, 0xffffffff))):
             word = lo if width == 32 else lo | (hi << 32)
             bits = f"{word:0{width}b}"
             unsigned = bits.find("1")
             signed = bits.find("0" if bits[0] == "1" else "1")
             constants = bytearray(256)
             struct.pack_into("<4I", constants, 12, lo, hi, unsigned & 0xffffffff, signed & 0xffffffff)
+            case = directory / f"leading-bit-{width}-{index}.case"
             case.write_bytes(constants + struct.pack("<4f", 1, 1, lo == hi, lo == hi) * 64)
-            subprocess.run(draw, check=True)
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
     # For -2, the signed search must cross into the low word; the unsigned search returns zero.
     program = [line.replace("s_flbit_i32_i64", "s_flbit_i32_b64") for line in scalar_leading_bit_values(64)]
     source.write_text(translate(program), encoding="ascii")
@@ -2439,21 +2446,25 @@ def scalar_bit_count_values(width):
 
 
 def check_scalar_bit_count_draw(directory, compiler, renderer, backend):
-    source, shader, case = (directory / name for name in ("bit-count.hlsl", "bit-count.cso", "bit-count.case"))
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source, shader = (directory / name for name in ("bit-count.hlsl", "bit-count.cso"))
     for width in (32, 64):
         program = scalar_bit_count_values(width)
         source.write_text(translate(program), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
-        for lo, hi in ((0, 0), (0xffffffff, 0xffffffff), (0x1234abcd, 0x5678ef90), (0, 0x80000000)):
+        cases = []
+        for index, (lo, hi) in enumerate(((0, 0), (0xffffffff, 0xffffffff), (0x1234abcd, 0x5678ef90),
+                                          (0, 0x80000000))):
             word = lo if width == 32 else lo | (hi << 32)
             ones = word.bit_count()
             zeros = width - ones
             constants = bytearray(256)
             struct.pack_into("<4I", constants, 12, lo, hi, zeros == 0, ones == 0)
+            case = directory / f"bit-count-{width}-{index}.case"
             case.write_bytes(constants + struct.pack("<4f", 1 + zeros / 1024, 1 + ones / 1024,
                                                       zeros != 0, ones != 0) * 64)
-            subprocess.run(draw, check=True)
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
     # The last input has one bit set in the high word and none in the low word.
     program = [line.replace("s_bcnt1_i32_b64 s62, s[44:45]", "s_bcnt1_i32_b32 s62, s44")
                for line in scalar_bit_count_values(64)]
@@ -2479,17 +2490,20 @@ def scalar_mul_hi_values(signed="i32"):
 
 
 def check_scalar_mul_hi_draw(directory, compiler, renderer, backend):
-    source, shader, case = (directory / name for name in ("mul-hi.hlsl", "mul-hi.cso", "mul-hi.case"))
+    source, shader = (directory / name for name in ("mul-hi.hlsl", "mul-hi.cso"))
     source.write_text(translate(scalar_mul_hi_values()), encoding="ascii")
     compile_shader(compiler, source, shader, ieee=False)
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
-    for a, b in ((0, 0x80000000), (0x7fffffff, 0x7fffffff), (0x80000000, 3),
-                 (3, 0x80000000), (0x1234abcd, 0x5678ef90), (0xffffffff, 0xffffffff)):
+    cases = []
+    for index, (a, b) in enumerate(((0, 0x80000000), (0x7fffffff, 0x7fffffff), (0x80000000, 3),
+                                    (3, 0x80000000), (0x1234abcd, 0x5678ef90), (0xffffffff, 0xffffffff))):
         signed_a, signed_b = struct.unpack("<ii", struct.pack("<II", a, b))
         constants = bytearray(256)
         struct.pack_into("<4I", constants, 12, a, b, (signed_a * signed_b >> 32) & 0xffffffff, a * b >> 32)
+        case = directory / f"mul-hi-{index}.case"
         case.write_bytes(constants + struct.pack("<4f", 1, 1, a == b, 0) * 64)
-        subprocess.run(draw, check=True)
+        cases.append((case, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
     # For the final inputs, signed high is zero and unsigned high is 0xfffffffe.
     source.write_text(translate(scalar_mul_hi_values("u32")), encoding="ascii")
     compile_shader(compiler, source, shader, ieee=False)
@@ -2508,13 +2522,13 @@ def scalar_pack_values(halves):
 
 
 def check_scalar_pack_draw(directory, compiler, renderer, backend):
-    source, shader, case = (directory / name for name in ("pack.hlsl", "pack.cso", "pack.case"))
-    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source, shader = (directory / name for name in ("pack.hlsl", "pack.cso"))
     for halves in PACK_HALVES:
         source.write_text(translate(scalar_pack_values(halves)), encoding="ascii")
         compile_shader(compiler, source, shader, ieee=False)
         # The third pair sets every bit of each half LL and LH select, so a mask that drops any one bit
         # of a selected half (0xfffd for the low half, 0xfffe0000 for the high half) breaks the equality.
+        cases = []
         for index, words in enumerate(((0x1234abcd, 0x5678ef90), (0xffff0000, 0x0000ffff),
                                        (0x0000ffff, 0xffffffff))):
             flag = index % 2
@@ -2522,17 +2536,19 @@ def check_scalar_pack_draw(directory, compiler, renderer, backend):
                         for word, half in zip(words, halves)]
             constants = bytearray(256)
             struct.pack_into("<IIHHI", constants, 12, *words, *selected, flag)
+            case = directory / f"pack-{halves}-{index}.case"
             case.write_bytes(constants + struct.pack("<4f", 1, flag, 0, 0) * 64)
-            subprocess.run(draw, check=True)
-            if halves == "lh" and index == 0:
-                # Compile LL against the unchanged LH reference; only the selected high half differs.
-                source.write_text(translate(scalar_pack_values("ll")), encoding="ascii")
-                mutant = directory / "wrong-pack.cso"
-                compile_shader(compiler, source, mutant, ieee=False)
-                wrong = subprocess.run([renderer, backend, "--check-pixel-case", mutant, case],
-                                       capture_output=True, text=True)
-                if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
-                    raise AssertionError("LL matched the LH reference")
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+        if halves == "lh":
+            # Compile LL against the unchanged first LH reference; only the selected high half differs.
+            source.write_text(translate(scalar_pack_values("ll")), encoding="ascii")
+            mutant = directory / "wrong-pack.cso"
+            compile_shader(compiler, source, mutant, ieee=False)
+            wrong = subprocess.run([renderer, backend, "--check-pixel-case", mutant, cases[0][0]],
+                                   capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError("LL matched the LH reference")
 
 
 def sext_values():

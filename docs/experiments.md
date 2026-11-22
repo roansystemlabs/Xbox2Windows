@@ -1909,6 +1909,12 @@ draw each. These three suites
 go from 108 device creations to 23, and DXC compiles one shader fewer, because
 the signed/unsigned control now reuses the group's compiled shader.
 
+The scalar leading-bit, bit-count, multiply-high, pack and carry-chain draws
+also run their reference inputs as one batch per compiled shader, each input
+in its own case file. Their mutated-shader controls keep one single-case draw
+each and reuse the case they were written for. These five checks go from 53
+device creations to 16.
+
 #The bitwise fixture uses AND, OR, XOR, NOT, BFI and three reversed shifts. Two constant sets exercise counts above 31. Exact mantissa bits distinguish the arithmetic and logical right shifts in GPU readback.
 
 ## Pixel color without a texture sample
