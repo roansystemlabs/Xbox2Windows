@@ -34,6 +34,11 @@ def is_word(value):
     return isinstance(value, int) or (isinstance(value, tuple) and value[0] in ("constant_word", "thread"))
 
 
+def offset_terms(tag):
+    """Return the ((axis, shift), ...) terms of a dispatch byte offset, or None."""
+    return tag[1] if isinstance(tag, tuple) and tag[0] == "offset" else None
+
+
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
@@ -99,6 +104,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Invalid scalar destination or movk immediate")
             signed = value - 0x10000 if value >= 0x8000 else value
             scalar[dst] = signed & 0xffffffff
+        elif m := re.fullmatch(r"s_lshl_b32 s(\d+), s(\d+), (\d+)", line):
+            dst, group, shift = map(int, m.groups())
+            tag = scalar.get(group)
+            axis = tag[1] if isinstance(tag, tuple) and tag[0] == "group" else None
+            # Only the first dispatch thread of a group: group * size, for a power-of-two size.
+            if (dst in pending or dst > 105 or group in pending or axis is None
+                    or dims[axis] & (dims[axis] - 1) or shift != dims[axis].bit_length() - 1):
+                raise ValueError("Unverified group base")
+            scalar[dst] = ("group_base", axis)
         elif m := re.fullmatch(r"s_load_dwordx4 s\[(\d+):(\d+)\], s\[(\d+):(\d+)\], (null|0x[0-9a-f]+)", line):
             dest, last, base, high = map(int, m.groups()[:4])
             offset = 0 if m[5] == "null" else int(m[5], 16)
@@ -156,13 +170,31 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or shift != dims[axis].bit_length() - 1 or vector.get(local) != ("local", axis)):
                 raise ValueError("Unverified dispatch index")
             vector[dst] = ("thread", axis)
+        elif m := re.fullmatch(r"v_add_lshl_u32 v(\d+), s(\d+), v(\d+), (\d+)", line):
+            dst, base, local, shift = map(int, m.groups())
+            tag = scalar.get(base)
+            axis = tag[1] if isinstance(tag, tuple) and tag[0] == "group_base" else None
+            # (group * size + local) << shift: a dispatch byte offset on one axis.
+            if (dst > 255 or base in pending or axis is None or shift > 31
+                    or vector.get(local) != ("local", axis)):
+                raise ValueError("Unverified dispatch byte offset")
+            vector[dst] = ("offset", ((axis, shift),))
+        elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
+            dst, src, shift, addend = map(int, m.groups())
+            tag, terms = vector.get(src), offset_terms(vector.get(addend))
+            # (thread << shift) + offset: one more axis in the byte offset. The store checks
+            # that the axes nest without overlap.
+            if (dst > 255 or shift > 31 or terms is None or not (isinstance(tag, tuple) and tag[0] == "thread")
+                    or any(tag[1] == axis for axis, _ in terms)):
+                raise ValueError("Unverified dispatch byte offset")
+            vector[dst] = ("offset", (*terms, (tag[1], shift)))
         elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
             # The element and row checks at the store bound the shift.
-            if dst > 255 or not (isinstance(tag, tuple) and tag[0] == "thread"):
+            if dst > 255 or shift > 31 or not (isinstance(tag, tuple) and tag[0] == "thread"):
                 raise ValueError("Unverified dispatch byte offset")
-            vector[dst] = ("thread_bytes", tag[1], shift)
+            vector[dst] = ("offset", ((tag[1], shift),))
         elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
             count = int(m[1] or 1)
@@ -187,17 +219,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 store_layout = ("index", index)
                 address = f"tid.{AXES[index]} * {stride}u + {offset}u"
             elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
-                    and all(isinstance(tag, tuple) for tag in tags)
-                    and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
-                # idxen offen: address = index * stride + byte offset + instruction offset.
-                (_, index), (_, column, shift) = tags
-                if (offset + 4 * count > 1 << shift or dims[column] << shift > stride):
+                    and isinstance(tags[0], tuple) and tags[0][0] == "thread"
+                    and offset_terms(tags[1]) is not None
+                    and tags[0][1] not in [axis for axis, _ in offset_terms(tags[1])]):
+                # idxen offen: address = index * stride + byte offset + instruction offset. The
+                # byte offset holds one or two axes; ordered by shift, each axis of one group must
+                # fit below the next shift, and the last one in the stride.
+                index, terms = tags[0][1], sorted(offset_terms(tags[1]), key=lambda term: term[1])
+                limits = [1 << shift for _, shift in terms[1:]] + [stride]
+                if (offset + 4 * count > 1 << terms[0][1]
+                        or any(dims[axis] << shift > limit for (axis, shift), limit in zip(terms, limits))):
                     raise ValueError("Store leaves its element or row")
-                store_layout = ("index_offset", index, column, shift)
-                address = f"tid.{AXES[index]} * {stride}u + (tid.{AXES[column]} << {shift}u) + {offset}u"
+                store_layout = ("index_offset", index, *terms)
+                columns = " + ".join(f"(tid.{AXES[axis]} << {shift}u)" for axis, shift in reversed(terms))
+                address = f"tid.{AXES[index]} * {stride}u + {columns} + {offset}u"
             else:
                 raise ValueError("Unsupported store address")
-            covered = {store_layout[1], *store_layout[2:3]} if store_layout[0] != "fixed" else set()
+            covered = ({store_layout[1], *(axis for axis, _ in store_layout[2:])}
+                       if store_layout[0] != "fixed" else set())
             if any(dims[axis] > 1 for axis in range(3) if axis not in covered):
                 raise ValueError("Store address does not separate every invocation of the group")
             if layout not in (None, store_layout):

@@ -1763,18 +1763,53 @@ takes one of two forms:
 - a row axis through `idxen` and a column axis through `offen`, with a
   `v_lshlrev_b32` byte offset. The store must fit in one element, and one
   group's row must fit in the stride.
+- a row axis through `idxen` and two column axes through `offen`, for groups
+  with all three dimensions active. The byte offset is
+  `(b << sb) + (a << sa)` with `sa < sb`: an inner axis, then an outer axis
+  added with `v_lshl_add_u32 vD, v<thread b>, sb, v<offset a>`. The store must
+  fit below `1 << sa`, one group's span of the inner axis must fit below
+  `1 << sb`, and one group's span of the outer axis must fit in the stride.
+  Each axis appears once in the address.
+
+LLVM 15 also forms a byte offset as `s_lshl_b32 sB, s<group A>, log2(size A)`
+followed by `v_add_lshl_u32 vD, sB, v<local A>, shift`, that is
+`(group * size + local) << shift`. As for `v_lshl_add_u32`, the size must be a
+power of two and the local ID must belong to the same axis.
 
 All stores in a program use one layout, so no two invocations of a group write
 the same bytes. A dispatch-thread index can also be stored as data. The
-translator does not model out-of-range behavior for structured buffers: the
-caller's stride and dispatch must keep every row in range. Addresses that need
+translator does not model out-of-range behavior for structured buffers. With
+several groups on an axis, the caller's stride must also hold the whole
+dispatch span of the outer column axis, the inner axis must stay below the next
+shift across the dispatch, and every row must fit the bound buffer. The
+translator only sees one group and cannot check these. Addresses that need
 other ALU forms, for example a `v_mad_u32_u24` row pitch, are still rejected.
+
+The three-axis form comes from LLVM 15.0.7 output for gfx1013. `llc-15` does
+not lower `llvm.amdgcn.workitem.id.*` in an `amdgpu_cs` function: it stops with
+a segmentation fault in `SI Fix SGPR copies`, even for local X alone. The probe
+is therefore an `amdgpu_kernel` for the same `amdgcn--amdpal` triple. Its
+output reads local X, Y and Z from `v0`, `v1` and `v2`, and group X, Y and Z
+from consecutive SGPRs after the kernel-argument pointer. `COMPUTE_PGM_RSRC2`
+is `0x1384`, which has `TIDIG_COMP_CNT = 2` and `TGID_X_EN`, `TGID_Y_EN` and
+`TGID_Z_EN` set. An `amdgpu_cs` function that takes the IDs as arguments
+compiles to the same five address instructions; its registers follow the
+argument list, so it confirms the instruction forms, not the register layout:
+
+```sh
+llc-15 -mtriple=amdgcn--amdpal -mcpu=gfx1013 -O2 -filetype=obj cube.ll -o cube.o
+llvm-objdump-15 -d --mcpu=gfx1013 cube.o
+```
+
+The `cube` fixture keeps those address instructions and their registers. Only
+the kernel-argument load is replaced with the descriptor-table load that the
+other fixtures use.
 
 ```sh
 python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-reg 8 --descriptor-offset 0 --group-reg 10 --group-reg-y 11 --stride 72 --output out/tile.hlsl
 ```
 
-The Windows fixture covers four group shapes, each with a full 320-word
+The Windows fixture covers five group shapes, each with a full 320-word
 readback:
 
 | Group | Dispatches |
@@ -1783,24 +1818,37 @@ readback:
 | 4×1×8 | 1×1×1 and 1×1×2 |
 | 4×4×1 | 1×1×1 and 3×2×1 |
 | 256×1×1 | 1×1×1 |
+| 4×4×4 | 1×1×1, 1×1×2 and 1×2×2 |
+
+The 4×4×4 case stores `tid.z` at `tid.z * 136 + (tid.y << 4) + (tid.x << 2)`,
+so both the address and the data depend on Z.
 
 The expected words come from an independent per-invocation model. For each
 shape, the following must fail on the adapter:
 
 - a flipped guard word;
 - the first group count against the larger reference;
-- recompiled HLSL with swapped axes;
-- recompiled HLSL that ignores Z (4×1×8 only);
-- recompiled HLSL with half the group X size.
+- recompiled HLSL with swapped axes (X and Y; for 4×4×4 also Y and Z, X and Z,
+  and Y and Z in the address only);
+- recompiled HLSL that ignores Z (4×1×8 and 4×4×4);
+- recompiled HLSL with half the group X size, and for 4×4×4 half the group Z
+  size.
+
+The recompiled variants run on the shape's largest dispatch. A swap of two
+axes with the same dispatch span leaves the buffer unchanged: Y and Z both span
+8 in the 1×2×2 dispatch, so the 4×4×4 Y/Z swap runs on 1×1×2.
 
 The CPU controls reject:
 
 - swapped local or group axes;
 - a non-power-of-two size whose shift still matches;
-- `v1` in a group whose Y is one;
+- `v1` in a group whose Y is one, and `v2` in a group whose Z is one;
 - duplicate or missing group registers;
 - an element or row overflow;
 - an index and a byte offset taken from the same axis;
+- an axis that appears twice in the byte offset;
+- an inner column span that reaches the outer shift;
+- a group base with the wrong shift or added to another axis's local ID;
 - two stores with transposed layouts.
 
 `tools/shader_profile_audit.py` passes the PSV0 size and tries the next one or

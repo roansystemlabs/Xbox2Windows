@@ -122,6 +122,22 @@ WIDE = [
     "buffer_store_dword v3, v3, s[12:15], 0 idxen",
     "s_endpgm",
 ]
+# 4x4x4 cube with all three axes in the address: row = dispatch Z through idxen, byte
+# offset = (dispatch Y << 4) + (dispatch X << 2); each invocation stores tid.z. The address
+# instructions are llc-15 -mcpu=gfx1013 output for an amdgpu_kernel; the kernel-argument load
+# is replaced by the descriptor-table load the other fixtures use.
+CUBE = [
+    "s_mov_b32 s1, 0",
+    "s_load_dwordx4 s[8:11], s[0:1], null",
+    "v_lshl_add_u32 v1, s3, 2, v1",
+    "s_lshl_b32 s0, s2, 2",
+    "v_add_lshl_u32 v3, s0, v0, 2",
+    "v_lshl_add_u32 v0, s4, 2, v2",
+    "v_lshl_add_u32 v1, v1, 4, v3",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v0, v[0:1], s[8:11], 0 idxen offen",
+    "s_endpgm",
+]
 INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
 RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
@@ -129,6 +145,7 @@ TILE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=72)
 SLAB_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_z=16, stride=68)
 QUAD_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=52)
 WIDE_BINDING = dict(FIXED_BINDING, group_reg=10, stride=4)
+CUBE_BINDING = dict(table_reg=0, descriptor_offset=0, group_reg=2, group_reg_y=3, group_reg_z=4, stride=136)
 CASES = [
     ("indexed", INDEXED, 32, INDEX_BINDING),
     ("fixed", FIXED, 1, FIXED_BINDING),
@@ -139,6 +156,7 @@ CASES = [
     ("slab", SLAB, (4, 1, 8), SLAB_BINDING),
     ("quad", QUAD, (4, 4, 1), QUAD_BINDING),
     ("wide", WIDE, (256, 1, 1), WIDE_BINDING),
+    ("cube", CUBE, (4, 4, 4), CUBE_BINDING),
 ]
 
 
@@ -155,6 +173,8 @@ def grid_words(name, groups):
                     words[(68 * z + 16 * x + 4) // 4:(68 * z + 16 * x + 4) // 4 + 2] = [z, x]
                 elif name == "quad":
                     words[(52 * y + 4 * x) // 4] = x
+                elif name == "cube":
+                    words[(136 * z + 16 * y + 4 * x) // 4] = z
                 else:
                     words[x] = x
     return words
@@ -165,7 +185,14 @@ GRID_DISPATCHES = {
     "slab": ((1, 1, 1), (1, 1, 2)),
     "quad": ((1, 1, 1), (3, 2, 1)),
     "wide": ((1, 1, 1),),
+    # Several groups in Z, then in Y and Z. Dispatch X stays one group: its column span must
+    # fit below the Y shift, and the Z rows (8 x 136 bytes) must fit the 320-word buffer.
+    "cube": ((1, 1, 1), (1, 1, 2), (1, 2, 2)),
 }
+# Recompiled mutations run on the largest dispatch. Swapping two axes that span the same range
+# leaves the buffer unchanged: Y and Z both span 8 in the 1x2x2 cube, so that swap runs on 1x1x2,
+# where Y spans 4 and Z spans 8.
+MUTATION_DISPATCH = {("cube", "swapped Y/Z"): (1, 1, 2)}
 
 
 def controls():
@@ -297,7 +324,55 @@ def grid_controls():
     # A store with an unresolved local ID as data is still rejected.
     must_reject(lambda: aot.lower([s.replace("v_mov_b32_e32 v6, v3", "v_mov_b32_e32 v6, v1") for s in TILE],
                                   (8, 8, 1), **TILE_BINDING))
+    cube_controls()
     audit_candidates()
+
+
+def cube_controls():
+    """Three address axes: exact output, then one rejection per broken assumption."""
+    def cube(*changes, group=(4, 4, 4), **binding):
+        lines = CUBE
+        for old, new in changes:
+            assert sum(old in line for line in lines) == 1, old
+            lines = [line.replace(old, new) for line in lines]
+        return aot.lower(lines, group, **(CUBE_BINDING | binding))
+
+    source = cube().splitlines()
+    assert "[numthreads(4,4,4)]" in source
+    assert "    outputData.Store(tid.z * 136u + (tid.y << 4u) + (tid.x << 2u) + 0u, tid.z);" in source
+    # Other group sizes: the shifts no longer match, or local Z is not launched.
+    for group in ((8, 4, 4), (4, 8, 4), (4, 4, 8), (4, 4, 2), (2, 4, 4), (4, 4, 1), (4, 1, 4), (4, 4, 3)):
+        must_reject(lambda: cube(group=group))
+    # A group X of 6 keeps the base shift of 2; with Y moved to bit 5 its span fits, so only the
+    # power-of-two rule of the group base rejects it.
+    must_reject(lambda: cube(("v1, v1, 4, v3", "v1, v1, 5, v3"), group=(6, 4, 4)))
+    # Group base: wrong shift, a register that is not a group ID, a pending destination.
+    for change in (("s0, s2, 2", "s0, s2, 3"), ("s0, s2, 2", "s0, s5, 2"), ("s0, s2, 2", "s0, s3, 2"),
+                   ("s_lshl_b32 s0,", "s_lshl_b32 s9,")):
+        must_reject(lambda: cube(change))
+    # Group base plus the local ID of another axis, or a base that was never scaled.
+    for change in (("s0, v0, 2", "s0, v2, 2"), ("v_add_lshl_u32 v3, s0,", "v_add_lshl_u32 v3, s2,")):
+        must_reject(lambda: cube(change))
+    # Byte offset terms: the same axis twice (in a 4x1x4 group, where X and Z still cover every
+    # invocation), a term that is not a dispatch index, and nesting that lets one group's X span
+    # reach the Y step, or one element reach the next X.
+    must_reject(lambda: cube(("v1, s3, 2, v1", "v1, s2, 2, v0"), group=(4, 1, 4), group_reg_y=None))
+    # The term control keeps local Y in v1, so v1 is not a dispatch index when it is shifted.
+    for changes in ((("v_lshl_add_u32 v1, s3, 2, v1", "v_lshl_add_u32 v4, s3, 2, v1"),),
+                    (("v1, v1, 4, v3", "v1, v1, 3, v3"),), (("s0, v0, 2", "s0, v0, 1"),),
+                    (("0 idxen offen", "0 idxen offen offset:4"),)):
+        must_reject(lambda: cube(*changes))
+    # The rows must hold one group's Y span; the index axis must not also be an offset term.
+    for binding in (dict(stride=60), dict(stride=None)):
+        must_reject(lambda: cube(**binding))
+    must_reject(lambda: cube(("v_lshl_add_u32 v0, s4, 2, v2", "v_mov_b32_e32 v0, v1"), group=(4, 4, 1),
+                             group_reg_z=None))
+    # Group registers: missing Z, Z equal to Y, or the table register as a group ID.
+    for binding in (dict(group_reg_z=None), dict(group_reg_z=3), dict(group_reg_z=5), dict(table_reg=2)):
+        must_reject(lambda: cube(**binding))
+    # Store address with only the X offset (Y not separated) or with an unscaled offset.
+    must_reject(lambda: cube(("v_lshl_add_u32 v1, v1, 4, v3", "v_mov_b32_e32 v1, v3")))
+    must_reject(lambda: cube(("v_lshl_add_u32 v1, v1, 4, v3", "v_lshl_add_u32 v1, v1, 4, v1")))
 
 
 def audit_candidates():
@@ -375,12 +450,18 @@ def grid_mutations(source, name):
     a, b = {"slab": ("tid.z", "tid.x")}.get(name, ("tid.x", "tid.y"))
     if name != "wide":
         yield "swapped axes", source.replace(a, "tid.T").replace(b, a).replace("tid.T", b)
-    if name == "slab":
+    if name in ("slab", "cube"):
         yield "Z ignored", source.replace("tid.z", "tid.y")
     dims = dict((case[0], case[2]) for case in CASES)[name]
-    shrunk = (dims[0] // 2, *dims[1:])
-    yield "halved group X", source.replace("[numthreads({},{},{})]".format(*dims),
-                                           "[numthreads({},{},{})]".format(*shrunk))
+    numthreads = "[numthreads({},{},{})]".format(*dims)
+    yield "halved group X", source.replace(numthreads, "[numthreads({},{},{})]".format(dims[0] // 2, *dims[1:]))
+    if name == "cube":
+        for a, b in (("tid.y", "tid.z"), ("tid.x", "tid.z")):
+            yield f"swapped {a[-1].upper()}/{b[-1].upper()}", (
+                source.replace(a, "tid.T").replace(b, a).replace("tid.T", b))
+        yield "Y/Z swapped in the address only", source.replace(
+            "tid.z * 136u + (tid.y << 4u)", "tid.y * 136u + (tid.z << 4u)")
+        yield "halved group Z", source.replace(numthreads, "[numthreads(4,4,2)]")
 
 
 def draw_grid(directory, compiler, cmd, case, name):
@@ -405,7 +486,6 @@ def draw_grid(directory, compiler, cmd, case, name):
         bad = subprocess.run(cmd, capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"{name}: a wrong group count escaped detection")
-    case.write_bytes(struct.pack("<321I", packed, *words))
     source = (directory / "store.hlsl").read_text(encoding="ascii")
     for label, mutated in grid_mutations(source, name):
         if mutated == source:
@@ -413,9 +493,13 @@ def draw_grid(directory, compiler, cmd, case, name):
         src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
         src.write_text(mutated, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        groups = MUTATION_DISPATCH.get((name, label), dispatches[-1])
+        assert groups in dispatches, (name, label)
+        case.write_bytes(struct.pack("<321I", groups[0] | groups[1] << 8 | groups[2] << 16,
+                                     *grid_words(name, groups)))
         bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
-            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection with groups={groups}")
     return 0
 
 
