@@ -30,6 +30,7 @@ using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
 
 void check_descriptor_heap_paging(ID3D12Device* device, bool swapped);
+void check_startup_sampler_x(ID3D12Device* device, bool swapped);
 
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
@@ -917,6 +918,13 @@ OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+template<bool Swapped>
+OperationResult run_startup_sampler_x(const OperationContext& ctx)
+{
+    check_startup_sampler_x(ctx.device, Swapped);
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1064,6 +1072,8 @@ const OperationSpec kOperations[] = {
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
     {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
+    {"--startup-sampler-x", 3, 3, nullptr, kNoGate, run_startup_sampler_x<false>},
+    {"--startup-sampler-x-swapped", 3, 3, nullptr, kNoGate, run_startup_sampler_x<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
 };
 

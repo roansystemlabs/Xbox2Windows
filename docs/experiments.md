@@ -4517,6 +4517,34 @@ ctest --preset dev --no-tests=error -R '^descriptor_heap_paging_' -V
 
 Repeat with `release`.
 
+### CreateSamplerX desktop sampler contract
+
+`d3d12x_sampler::to_desktop` ([`src/d3d12x_sampler.h`](../src/d3d12x_sampler.h)) turns the 0x6C-byte descriptor passed to device slot #61 into a desktop `D3D12_SAMPLER_DESC`. The field offsets come from the public XCL ABI notes and are a desktop policy, not a verified console contract: address U/V/W at `+0x18/+0x1c/+0x20`, MinLOD and MaxLOD at `+0x24/+0x28`, MipLODBias at `+0x2c`, MaxAnisotropy at `+0x34` and the comparison function at `+0x40`. [Tracking issue #874](https://github.com/R0Y00/Xbox2Windows/issues/874) · [XCL ABI notes](https://github.com/ivall/xcl/blob/main/HANDOFF.md)
+
+| Field | Desktop result |
+| --- | --- |
+| AddressU/V/W | WRAP, MIRROR, CLAMP and MIRROR_ONCE are applied. BORDER is refused because no border-colour offset is known. Other values are refused per axis. |
+| MinLOD, MaxLOD | Applied. NaN or infinity and MinLOD above MaxLOD are refused. |
+| MipLODBias | Applied inside D3D12's [-16, 15.99] range. Values outside it and NaN are refused. |
+| MaxAnisotropy | Applied for 1 to 16. Other values are refused. |
+| ComparisonFunc | NEVER to ALWAYS are accepted but not applied, and the desktop value is `D3D12_COMPARISON_FUNC_NONE`. The fixed filter does not compare, and desktop D3D12 would ignore the function with debug message 1361. |
+| Filter | No offset is known. The policy always uses `D3D12_FILTER_ANISOTROPIC`. |
+| Other 76 bytes | Ignored. |
+
+A refusal leaves the output descriptor unchanged. `startup_sampler_x_contract` checks every applied field, the ignored bytes and 15 refusals on the CPU.
+
+`startup_sampler_x_{hardware,warp}` writes three descriptors byte by byte from the fixture's own offsets and fills the other bytes with a nonzero pattern. Each descriptor gives the three axes three different address modes. The translated samplers go into one shader-visible sampler heap and sample an 8×8×8 `R8G8B8A8_UNORM` 3D texture with four levels. Every texel encodes its level and x, y and z. Each of the 11 draws samples texel centres from −1 to +2 texture widths on every axis. `SampleLevel` cases check the MinLOD and MaxLOD clamp, and `SampleGrad` cases with isotropic footprints of 1, 2, 4 and 8 texels check the clamp and a bias of +1. An independent CPU addressing model supplies all 35,451 expected words. `startup_sampler_x_swapped_*` exchanges the heap slots of the first two samplers and passes only when the readback changes.
+
+On Windows 11 build 26200.9974, the RTX 3070 (`32.0.16.2101`) and WARP (`10.0.26100.9818`) matched all 35,451 words in Debug and Release with the D3D12 debug layer enabled. There were zero debug errors and warnings. The swapped control changed 33,480 words on both adapters. Six translator mutations were each caught on both adapters: exchanged U/V offsets, W read from the U offset, MIRROR_ONCE mapped to MIRROR, MinLOD dropped, MaxLOD dropped and the bias dropped. Accepting BORDER was caught by the CPU check. Filter selection, border colour, comparison sampling and the remaining bytes still need independent evidence from a caller.
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check d3d12x_sampler_check
+ctest --preset dev --no-tests=error -R '^startup_sampler_x_' -V
+```
+
+Repeat with `release`.
+
 ### Shader-visible descriptor windows across submissions
 
 `descriptor_window_submissions` and `descriptor_window_stale` use one shader-visible CBV/SRV/UAV heap with 1,000,000 descriptors. A source-built `cs_6_0` shader reads a word through a one-SRV descriptor table and writes it to the selected output word. The fixture binds slot 0 for the first submission, waits for fence 1, resets the allocator and command list, binds slot 999,999, then submits and waits for fence 2. It checks both words after each fence. The stale case binds slot 0 again and must change only the second word relative to the baseline. [Tracking issue #874](https://github.com/R0Y00/Xbox2Windows/issues/874) · [Two-submission pattern #829](https://github.com/R0Y00/Xbox2Windows/pull/829)

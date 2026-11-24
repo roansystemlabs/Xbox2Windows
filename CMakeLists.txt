@@ -300,6 +300,12 @@ add_custom_command(OUTPUT "${descriptor_window_cs}" COMMAND "${DXC_EXECUTABLE}" 
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/descriptor_window_submissions.hlsl"
     DEPENDS tests/descriptor_window_submissions.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/descriptor_window_submissions.cpp "${descriptor_window_cs}")
+set(startup_sampler_x_cs "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_x_cs.h")
+add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
+    -Vn startup_sampler_x_cs -Fh "${startup_sampler_x_cs}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_sampler_x.hlsl"
+    DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp src/d3d12x_sampler.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)
@@ -534,6 +540,11 @@ endforeach()
 add_test(NAME d3d12x_pso_reject_warp COMMAND d3d12x_device_check
     "$<TARGET_FILE:d3d12_xs_shim>" reject warp)
 set_tests_properties(d3d12x_pso_static_sampler_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# CreateSamplerX desktop policy: CPU field and refusal checks (#874). The GPU readback is
+# offscreen_check --startup-sampler-x.
+add_executable(d3d12x_sampler_check tests/d3d12x_sampler_check.cpp src/d3d12x_sampler.cpp)
+target_compile_features(d3d12x_sampler_check PRIVATE cxx_std_17)
+add_test(NAME startup_sampler_x_contract COMMAND d3d12x_sampler_check)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
@@ -669,6 +680,11 @@ foreach(adapter IN ITEMS hardware warp)
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     set_tests_properties(descriptor_heap_paging_swapped_${adapter}
         PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_paging swapped=0")
+    add_test(NAME startup_sampler_x_${adapter} COMMAND offscreen_check ${adapter} --startup-sampler-x)
+    add_test(NAME startup_sampler_x_swapped_${adapter}
+        COMMAND offscreen_check ${adapter} --startup-sampler-x-swapped)
+    set_tests_properties(startup_sampler_x_${adapter} startup_sampler_x_swapped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
 endforeach()
 
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"
