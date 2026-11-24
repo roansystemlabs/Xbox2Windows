@@ -59,6 +59,17 @@ extern const IMAGE_TLS_DIRECTORY64 _tls_used = {
     reinterpret_cast<ULONGLONG>(&_tls_index), reinterpret_cast<ULONGLONG>(&__xl_a + 1), 0, 0};
 }
 
+// The thread-locals below must be constant-initialized: this EXE has no C runtime to run a dynamic TLS
+// initializer, so one would leave t_array zero in the template and fail to link (__dyn_tls_init). MSVC 19.42
+// initializes a thread-local aggregate dynamically when its initializer calls a function, even a constexpr
+// one, so t_array is spelled out as a list of 0xFF bytes instead of a constexpr call (#1094).
+#define FF_4 0xFF, 0xFF, 0xFF, 0xFF
+#define FF_16 FF_4, FF_4, FF_4, FF_4
+#define FF_64 FF_16, FF_16, FF_16, FF_16
+#define FF_256 FF_64, FF_64, FF_64, FF_64
+#define FF_1024 FF_256, FF_256, FF_256, FF_256
+#define ARRAY_TEMPLATE {{FF_1024, FF_1024, FF_1024, FF_1024, FF_1024}}
+
 namespace {
 constexpr unsigned ARRAY_BYTES = 0x1400;
 
@@ -66,15 +77,18 @@ struct Array {
     unsigned char bytes[ARRAY_BYTES];
 };
 
-constexpr Array make_array() {
-    Array array{};
-    for (unsigned i = 0; i < ARRAY_BYTES; ++i) array.bytes[i] = 0xFF;
-    return array;
+constexpr Array ARRAY_CHECK = ARRAY_TEMPLATE;  // the same list, checked byte for byte at compile time
+
+constexpr bool array_template_complete() {
+    for (unsigned i = 0; i < ARRAY_BYTES; ++i)
+        if (ARRAY_CHECK.bytes[i] != 0xFF) return false;
+    return true;
 }
+static_assert(array_template_complete(), "ARRAY_TEMPLATE must hold ARRAY_BYTES bytes of 0xFF");
 }  // namespace
 
 __declspec(thread) int t_value = 7;
-__declspec(thread) Array t_array = make_array();
+__declspec(thread) Array t_array = ARRAY_TEMPLATE;
 
 namespace {
 constexpr UINT CREATE_FAILED = 0xE0000002u, WAIT_FAILED_CODE = 0xE0000003u, LOG_FULL = 0xE0000006u;

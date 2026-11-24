@@ -29,24 +29,42 @@ extern "C" __declspec(dllimport) void sink_record(void* module, unsigned reason,
 
 constexpr std::uint32_t SPAN_WORDS = 2048;  // 8 KiB
 
+// g_span must be constant-initialized so its words are in the TLS data template; a dynamic
+// initializer would leave the template zero and fill each thread's copy later, through the C
+// runtime. MSVC 19.42 initializes a thread-local aggregate dynamically when its initializer calls a
+// function, even a constexpr one, so g_span is spelled out with SPAN_WORD expressions (#1094).
+#define SPAN_WORD(i) (0xA5000000u ^ ((i) * 0x9E3779B1u))
+#define SPAN_WORDS_4(i) SPAN_WORD(i), SPAN_WORD((i) + 1u), SPAN_WORD((i) + 2u), SPAN_WORD((i) + 3u)
+#define SPAN_WORDS_16(i) SPAN_WORDS_4(i), SPAN_WORDS_4((i) + 4u), SPAN_WORDS_4((i) + 8u), SPAN_WORDS_4((i) + 12u)
+#define SPAN_WORDS_64(i) \
+    SPAN_WORDS_16(i), SPAN_WORDS_16((i) + 16u), SPAN_WORDS_16((i) + 32u), SPAN_WORDS_16((i) + 48u)
+#define SPAN_WORDS_256(i) \
+    SPAN_WORDS_64(i), SPAN_WORDS_64((i) + 64u), SPAN_WORDS_64((i) + 128u), SPAN_WORDS_64((i) + 192u)
+#define SPAN_WORDS_1024(i) \
+    SPAN_WORDS_256(i), SPAN_WORDS_256((i) + 256u), SPAN_WORDS_256((i) + 512u), SPAN_WORDS_256((i) + 768u)
+#define SPAN_TEMPLATE {{SPAN_WORDS_1024(0u), SPAN_WORDS_1024(1024u)}}
+
 // The template value of g_span[i]; tests/cpu/native_tls_value_check.py computes the same words.
-constexpr std::uint32_t span_word(std::uint32_t i) { return 0xA5000000u ^ (i * 0x9E3779B1u); }
+constexpr std::uint32_t span_word(std::uint32_t i) { return SPAN_WORD(i); }
 
 struct Span {
     std::uint32_t words[SPAN_WORDS];
 };
 
-constexpr Span make_span() {
-    Span span{};
-    for (std::uint32_t i = 0; i < SPAN_WORDS; ++i) span.words[i] = span_word(i);
-    return span;
+constexpr Span SPAN_CHECK = SPAN_TEMPLATE;  // the same list, checked word for word at compile time
+
+constexpr bool span_template_complete() {
+    for (std::uint32_t i = 0; i < SPAN_WORDS; ++i)
+        if (SPAN_CHECK.words[i] != span_word(i)) return false;
+    return true;
 }
+static_assert(span_template_complete(), "SPAN_TEMPLATE must list span_word(0..SPAN_WORDS-1) in order");
 
 // Global scope by design: the linker must emit g_tls and g_span in the TLS data
 // template and the callback addresses in .CRT$XL*. An anonymous namespace would
 // give them internal linkage and obscure the template in a dumpbin review.
 __declspec(thread) int g_tls = 7;
-__declspec(thread) Span g_span = make_span();
+__declspec(thread) Span g_span = SPAN_TEMPLATE;
 
 constexpr unsigned CALLER_TLS = 1;
 constexpr unsigned CALLER_ENTRY = 2;

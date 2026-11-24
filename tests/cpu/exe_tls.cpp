@@ -56,24 +56,42 @@ extern const IMAGE_TLS_DIRECTORY64 _tls_used = {
     reinterpret_cast<ULONGLONG>(&_tls_index), reinterpret_cast<ULONGLONG>(&__xl_a + 1), 0, 0};
 }
 
+// The thread-locals below must be constant-initialized: this EXE has no C runtime to run a dynamic TLS
+// initializer, so one would leave g_span zero in the template and fail to link (__dyn_tls_init). MSVC 19.42
+// initializes a thread-local aggregate dynamically when its initializer calls a function, even a constexpr
+// one, so g_span is spelled out with SPAN_WORD expressions instead of a constexpr call (#1094).
+#define SPAN_WORD(i) (0xA5000000u ^ ((i) * 0x9E3779B1u))
+#define SPAN_WORDS_4(i) SPAN_WORD(i), SPAN_WORD((i) + 1u), SPAN_WORD((i) + 2u), SPAN_WORD((i) + 3u)
+#define SPAN_WORDS_16(i) SPAN_WORDS_4(i), SPAN_WORDS_4((i) + 4u), SPAN_WORDS_4((i) + 8u), SPAN_WORDS_4((i) + 12u)
+#define SPAN_WORDS_64(i) \
+    SPAN_WORDS_16(i), SPAN_WORDS_16((i) + 16u), SPAN_WORDS_16((i) + 32u), SPAN_WORDS_16((i) + 48u)
+#define SPAN_WORDS_256(i) \
+    SPAN_WORDS_64(i), SPAN_WORDS_64((i) + 64u), SPAN_WORDS_64((i) + 128u), SPAN_WORDS_64((i) + 192u)
+#define SPAN_WORDS_1024(i) \
+    SPAN_WORDS_256(i), SPAN_WORDS_256((i) + 256u), SPAN_WORDS_256((i) + 512u), SPAN_WORDS_256((i) + 768u)
+#define SPAN_TEMPLATE {{SPAN_WORDS_1024(0u), SPAN_WORDS_1024(1024u)}}
+
 namespace {
 constexpr std::uint32_t SPAN_WORDS = 2048;  // 8 KiB, as in tests/cpu/tls_value.cpp
 
-constexpr std::uint32_t span_word(std::uint32_t i) { return 0xA5000000u ^ (i * 0x9E3779B1u); }
+constexpr std::uint32_t span_word(std::uint32_t i) { return SPAN_WORD(i); }
 
 struct Span {
     std::uint32_t words[SPAN_WORDS];
 };
 
-constexpr Span make_span() {
-    Span span{};
-    for (std::uint32_t i = 0; i < SPAN_WORDS; ++i) span.words[i] = span_word(i);
-    return span;
+constexpr Span SPAN_CHECK = SPAN_TEMPLATE;  // the same list, checked word for word at compile time
+
+constexpr bool span_template_complete() {
+    for (std::uint32_t i = 0; i < SPAN_WORDS; ++i)
+        if (SPAN_CHECK.words[i] != span_word(i)) return false;
+    return true;
 }
+static_assert(span_template_complete(), "SPAN_TEMPLATE must list span_word(0..SPAN_WORDS-1) in order");
 }  // namespace
 
 __declspec(thread) int g_tls = 7;
-__declspec(thread) Span g_span = make_span();
+__declspec(thread) Span g_span = SPAN_TEMPLATE;
 
 namespace {
 constexpr UINT CREATE_FAILED = 0xE0000002u, WAIT_FAILED_CODE = 0xE0000003u, LOG_FULL = 0xE0000006u;
